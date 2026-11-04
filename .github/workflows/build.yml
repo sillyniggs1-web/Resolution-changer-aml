@@ -1,0 +1,78 @@
+name: Build HEXED Resolution from ZIP
+
+# Repo only needs: this file at .github/workflows/build.yml + one .zip in the repo root.
+# Push (or re-upload) the zip and it is unzipped and compiled automatically.
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+env:
+  # Official AML SDK headers, fetched at a pinned commit (MIT).
+  AML_COMMIT: 3ef5c918ec855f3db5e3a216dcb176e209b89922
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip the project
+        run: |
+          set -e
+          ZIP="$(ls -t ./*.zip 2>/dev/null | head -n1 || true)"
+          if [ -z "$ZIP" ]; then echo "::error::No .zip found in the repo root"; exit 1; fi
+          echo "Using $ZIP"
+          rm -rf work && mkdir work
+          unzip -q "$ZIP" -d work
+          MK="$(find work -path '*/jni/Android.mk' | head -n1)"
+          if [ -z "$MK" ]; then echo "::error::jni/Android.mk not found inside the zip"; exit 1; fi
+          PROJ="$(cd "$(dirname "$MK")/.." && pwd)"
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+          echo "Project root: $PROJ"
+
+      - name: Add AML SDK headers (if the zip has none)
+        run: |
+          set -e
+          if [ ! -f "$PROJ/jni/mod/amlmod.h" ]; then
+            git clone https://github.com/RusJJ/AndroidModLoader.git "$RUNNER_TEMP/aml"
+            git -C "$RUNNER_TEMP/aml" checkout "$AML_COMMIT"
+            rm -rf "$PROJ/jni/mod"
+            cp -r "$RUNNER_TEMP/aml/template_of_mod/mod" "$PROJ/jni/mod"
+          fi
+
+      - name: Set up Android NDK r26d
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Compile
+        run: |
+          "${{ steps.ndk.outputs.ndk-path }}/ndk-build" \
+            NDK_PROJECT_PATH="$PROJ" \
+            APP_BUILD_SCRIPT="$PROJ/jni/Android.mk" \
+            NDK_APPLICATION_MK="$PROJ/jni/Application.mk" \
+            NDK_DEBUG=0 -j"$(nproc)"
+
+      - name: Verify the .so
+        run: |
+          set -e
+          BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SO="$(find "$PROJ/libs" -name 'lib*.so' | head -n1)"
+          test -n "$SO"
+          "$BIN/llvm-readelf" -h "$SO" | grep -E "Class:\s+ELF32"
+          "$BIN/llvm-readelf" -h "$SO" | grep -E "Machine:\s+ARM"
+          "$BIN/llvm-nm" -D --defined-only "$SO" | grep -E " (__GetModInfo|OnModLoad)$"
+          mkdir -p out
+          cp "$SO" out/
+          find "$PROJ" -name '*.lua' -not -path '*/jni/*' -exec cp {} out/ \;
+          cp "$PROJ"/README.md out/ 2>/dev/null || true
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HexedResolution-armeabi-v7a
+          path: out/
