@@ -3,7 +3,7 @@ name: Build HEXED Resolution
 # 1. Put the source ZIP at the repo root (only one .zip, or set zip_name).
 # 2. Actions -> "Build HEXED Resolution" -> Run workflow (also runs on push of a .zip).
 # 3. Download the "HEXED-Resolution-compiled" artifact:
-#    libs/armeabi-v7a/libHexedResolution.so + lua/ + config/ + BUILD-INFO.txt
+#    libs/armeabi-v7a/libHEXED_Resolution.so + lua/ + docs/ + BUILD-INFO.txt
 
 on:
   workflow_dispatch:
@@ -50,15 +50,19 @@ jobs:
           fi
           SRC="$RUNNER_TEMP/src"; rm -rf "$SRC"; mkdir -p "$SRC"
           unzip -q "$ZIP" -d "$SRC"; rm -rf "$SRC/__MACOSX"
-          # Project root = shallowest folder with Android.mk (ignoring vendored aml-psdk)
-          ROOT=$(find "$SRC" -name Android.mk -not -path '*/aml-psdk/*' | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2- | xargs dirname)
-          [ -n "$ROOT" ] || { echo "::error::No Android.mk in ZIP"; exit 1; }
-          for f in mod/amlmod.h mod/iaml.h aml-psdk/sdk_base.h; do
-            [ -f "$ROOT/$f" ] || { echo "::error::Missing $f"; exit 1; }
+
+          # Android.mk = shallowest one (ignoring vendored aml-psdk). It may sit in jni/ or at the root.
+          MK=$(find "$SRC" -name Android.mk -not -path '*/aml-psdk/*' | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2-)
+          [ -n "$MK" ] || { echo "::error::No Android.mk in ZIP"; exit 1; }
+          MKDIR=$(dirname "$MK")
+          if [ "$(basename "$MKDIR")" = "jni" ]; then ROOT=$(dirname "$MKDIR"); else ROOT="$MKDIR"; fi
+          APPMK="$MKDIR/Application.mk"; [ -f "$APPMK" ] || APPMK=""
+
+          for f in mod/amlmod.h mod/iaml.h; do
+            [ -f "$ROOT/$f" ] || { echo "::error::Missing $f (AML headers must be inside the ZIP)"; exit 1; }
           done
-          echo "Source: $ZIP | Root: $ROOT"
-          echo "SOURCE_ZIP=$ZIP" >> "$GITHUB_ENV"
-          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Source: $ZIP | Root: $ROOT | Android.mk: $MK | Application.mk: ${APPMK:-none}"
+          { echo "SOURCE_ZIP=$ZIP"; echo "ROOT=$ROOT"; echo "MK=$MK"; echo "APPMK=$APPMK"; } >> "$GITHUB_ENV"
 
       - name: Cache NDK
         uses: actions/cache@v4
@@ -80,10 +84,10 @@ jobs:
         run: |
           set -euo pipefail
           cd "$ROOT"
-          ARGS=(NDK_PROJECT_PATH="$ROOT" APP_BUILD_SCRIPT="$ROOT/Android.mk"
+          ARGS=(NDK_PROJECT_PATH="$ROOT" APP_BUILD_SCRIPT="$MK"
                 NDK_OUT="$ROOT/build/obj" NDK_LIBS_OUT="$ROOT/build/libs" NDK_DEBUG=0)
-          if [ -f Application.mk ]; then
-            ARGS+=(NDK_APPLICATION_MK="$ROOT/Application.mk")
+          if [ -n "$APPMK" ]; then
+            ARGS+=(NDK_APPLICATION_MK="$APPMK")
           else
             ARGS+=(APP_ABI=armeabi-v7a APP_PLATFORM=android-21 APP_STL=c++_static)
           fi
@@ -96,16 +100,21 @@ jobs:
           RE="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           mapfile -t SOS < <(find build/libs -name '*.so' ! -name 'libc++_shared.so' | sort)
           [ "${#SOS[@]}" -gt 0 ] || { echo "::error::No .so produced"; exit 1; }
+
+          # Every HEXED_* function the Lua declares in ffi.cdef must be exported by the .so,
+          # so a Lua/native mismatch fails the build instead of failing in game.
+          mapfile -t API < <(grep -rhoE '\bHEXED_[A-Za-z0-9_]+\s*\(' lua 2>/dev/null | sed 's/[ (]//g' | sort -u)
+          echo "Lua API to verify (${#API[@]}): ${API[*]:-none}"
+
           : > "$RUNNER_TEMP/sha256.txt"
           for SO in "${SOS[@]}"; do
             ABI=$(basename "$(dirname "$SO")")
             SYMS=$("$RE" --dyn-syms --wide "$SO")
             echo "== $SO ($ABI)"
-            # AML must find __GetModInfo; Lua (FFI) must find hexed_command
-            for S in __GetModInfo hexed_command; do
-              grep -qw "$S" <<< "$SYMS" || { echo "::error::$SO does not export $S"; exit 1; }
+            for S in __GetModInfo OnModLoad "${API[@]}"; do
+              grep -qw -- "$S" <<< "$SYMS" || { echo "::error::$SO does not export $S"; exit 1; }
             done
-            [ "$ABI" != "armeabi-v7a" ] || "$RE" -h "$SO" | grep -q 'ARM$' || { echo "::error::$SO is not 32-bit ARM"; exit 1; }
+            [ "$ABI" != "armeabi-v7a" ] || "$RE" -h "$SO" | grep -Eq 'Machine:\s+ARM$' || { echo "::error::$SO is not 32-bit ARM"; exit 1; }
             ( cd "$(dirname "$SO")" && sha256sum "$(basename "$SO")" | sed "s#  # ($ABI)  #" ) >> "$RUNNER_TEMP/sha256.txt"
           done
           cat "$RUNNER_TEMP/sha256.txt"
@@ -118,7 +127,7 @@ jobs:
             A=$(basename "$D"); mkdir -p "$OUT/libs/$A"
             find "$D" -maxdepth 1 -name '*.so' ! -name 'libc++_shared.so' -exec cp {} "$OUT/libs/$A/" \;
           done
-          for X in lua config NEZUKO-COMPAT.md README.md INSTALL.md TESTING.md; do
+          for X in lua docs README.md INSTALL.md; do
             [ -e "$ROOT/$X" ] && cp -r "$ROOT/$X" "$OUT/" || true
           done
           { echo "Source: $SOURCE_ZIP"; echo "Commit: $GITHUB_SHA"; echo "NDK: $NDK_VERSION"
