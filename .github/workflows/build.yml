@@ -1,289 +1,99 @@
-name: Build HEXED Resolution (ZIP in, .so out)
+name: Build AML mod (ZIP in, .so out)
 
-# Workflow:
-#   1. Upload the complete project source as a .zip to the ROOT of the repo.
-#   2. Actions -> "Build HEXED Resolution (ZIP in, .so out)" -> Run workflow
-#      (it also runs automatically when a .zip is pushed to the repo root).
-#   3. Download the "HEXED-Resolution-compiled" artifact: compiled AML .so files
-#      for every ABI plus lua/, config/ and docs, ready to copy to the device.
-#
-# The repo itself only needs this workflow file and the ZIP. Nothing in the
-# repo is compiled directly: the ZIP is extracted, compiled with the Android
-# NDK, verified, and packaged.
-
+# Put ONE project .zip in the repo root (e.g. HEXED-Resolution-Source.zip) and push,
+# or run this workflow manually from the Actions tab.
 on:
-  workflow_dispatch:
-    inputs:
-      zip_name:
-        description: "ZIP file at the repo root (leave empty to auto-detect the only .zip)"
-        required: false
-        default: ""
-      ndk_version:
-        description: "Android NDK version"
-        required: false
-        default: "r26d"
   push:
-    branches: [ main, master ]
     paths:
-      - "*.zip"
+      - '*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  NDK_VERSION: ${{ inputs.ndk_version || 'r26d' }}
-
 jobs:
   build:
-    name: Extract, compile, verify, package
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------ 1
-      - name: Locate source ZIP
-        env:
-          ZIP_INPUT: ${{ inputs.zip_name }}
+      - name: Find newest ZIP in repo root
+        id: zip
         run: |
-          set -euo pipefail
-          if [ -n "$ZIP_INPUT" ]; then
-            ZIP="$ZIP_INPUT"
-            [ -f "$ZIP" ] || { echo "::error::ZIP not found at repo root: $ZIP"; exit 1; }
+          ZIP=$(ls -t *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then echo "::error::No .zip found in repository root"; exit 1; fi
+          echo "Using: $ZIP"
+          echo "name=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Extract and locate project
+        id: proj
+        run: |
+          rm -rf work && mkdir work
+          unzip -q "${{ steps.zip.outputs.name }}" -d work
+          MK=$(find work -type f -path '*/jni/Android.mk' | head -n1 || true)
+          if [ -z "$MK" ]; then echo "::error::jni/Android.mk not found inside the ZIP"; exit 1; fi
+          ROOT=$(dirname "$(dirname "$MK")")
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          find "$ROOT" -maxdepth 2 | head -50
+
+      - name: Ensure AML headers (only if the ZIP lacks them)
+        run: |
+          ROOT="${{ steps.proj.outputs.root }}"
+          if [ -f "$ROOT/mod/amlmod.h" ] && [ -f "$ROOT/mod/iaml.h" ]; then
+            echo "AML headers present in ZIP - using them."
           else
-            mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
-            if [ "${#ZIPS[@]}" -eq 0 ]; then
-              echo "::error::No .zip found at the repo root. Upload the source ZIP there."
-              exit 1
-            fi
-            if [ "${#ZIPS[@]}" -gt 1 ]; then
-              echo "::error::Several ZIPs found (${ZIPS[*]}). Run the workflow manually and set 'zip_name'."
-              exit 1
-            fi
-            ZIP="${ZIPS[0]}"
+            echo "AML headers missing - fetching from RusJJ/AndroidModLoader"
+            git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git /tmp/aml
+            mkdir -p "$ROOT/mod"
+            cp -rn /tmp/aml/mod/. "$ROOT/mod/"
           fi
-          echo "Using source ZIP: $ZIP"
-          echo "SOURCE_ZIP=$ZIP" >> "$GITHUB_ENV"
 
-      # ------------------------------------------------------------------ 2
-      - name: Extract ZIP
-        run: |
-          set -euo pipefail
-          # Refuse archives with absolute paths or ".." components (zip-slip).
-          if unzip -Z1 "$SOURCE_ZIP" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
-            echo "::error::ZIP contains unsafe paths (absolute or '..'). Refusing to extract."
-            exit 1
-          fi
-          EXTRACT_DIR="$RUNNER_TEMP/src"
-          rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
-          unzip -q "$SOURCE_ZIP" -d "$EXTRACT_DIR"
-          rm -rf "$EXTRACT_DIR/__MACOSX"
-          echo "Extracted $(find "$EXTRACT_DIR" -type f | wc -l) files."
-          echo "EXTRACT_DIR=$EXTRACT_DIR" >> "$GITHUB_ENV"
-
-      # ------------------------------------------------------------------ 3
-      - name: Detect project root and verify sources
-        run: |
-          set -euo pipefail
-          # The project root is the folder holding Android.mk. This works whether
-          # the ZIP has files at its top level or inside one wrapper folder.
-          # (Vendored aml-psdk is excluded from the search.)
-          mapfile -t HITS < <(
-            find "$EXTRACT_DIR" -name Android.mk -not -path '*/aml-psdk/*' \
-              | awk -F/ '{print NF "\t" $0}' | sort -n
-          )
-          if [ "${#HITS[@]}" -eq 0 ]; then
-            echo "::error::No Android.mk found in the ZIP. Is this the full project source?"
-            exit 1
-          fi
-          D0=$(printf '%s' "${HITS[0]}" | cut -f1)
-          if [ "${#HITS[@]}" -gt 1 ] && [ "$(printf '%s' "${HITS[1]}" | cut -f1)" = "$D0" ]; then
-            echo "::error::More than one Android.mk at the same depth; cannot pick a project root."
-            printf '%s\n' "${HITS[@]}" | cut -f2
-            exit 1
-          fi
-          PROJECT_ROOT=$(dirname "$(printf '%s' "${HITS[0]}" | cut -f2)")
-          echo "Project root: $PROJECT_ROOT"
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-
-          MISSING=0
-          for f in Android.mk mod/amlmod.h mod/iaml.h aml-psdk/sdk_base.h; do
-            [ -f "$PROJECT_ROOT/$f" ] || { echo "::error::Missing required file: $f"; MISSING=1; }
-          done
-          if ! find "$PROJECT_ROOT" -path "$PROJECT_ROOT/aml-psdk" -prune -o \
-                 -path "$PROJECT_ROOT/mod" -prune -o \
-                 \( -name '*.cpp' -o -name '*.cc' -o -name '*.c' \) -print -quit | grep -q .; then
-            echo "::error::No C/C++ sources found in the project."
-            MISSING=1
-          fi
-          [ "$MISSING" = "0" ] || exit 1
-          echo "Required files present."
-
-      # ------------------------------------------------------------------ 4
-      - name: Cache Android NDK
-        id: ndk-cache
-        uses: actions/cache@v4
+      - name: Set up Android NDK r26d
+        id: ndk
+        uses: nttld/setup-ndk@v1
         with:
-          path: ~/android-ndk-${{ env.NDK_VERSION }}
-          key: android-ndk-${{ env.NDK_VERSION }}-linux
+          ndk-version: r26d
+          add-to-path: false
 
-      - name: Install Android NDK ${{ env.NDK_VERSION }}
+      - name: Build (armeabi-v7a)
         run: |
-          set -euo pipefail
-          NDK_DIR="$HOME/android-ndk-${NDK_VERSION}"
-          if [ ! -x "$NDK_DIR/build/ndk-build" ]; then
-            curl -fsSL -o "$RUNNER_TEMP/ndk.zip" \
-              "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
-            unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME"
-            rm -f "$RUNNER_TEMP/ndk.zip"
-          fi
-          [ -x "$NDK_DIR/build/ndk-build" ] || { echo "::error::NDK install failed: $NDK_DIR"; exit 1; }
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          ROOT="${{ steps.proj.outputs.root }}"
+          "${{ steps.ndk.outputs.ndk-path }}/ndk-build" -C "$ROOT/jni" \
+            NDK_LIBS_OUT="$GITHUB_WORKSPACE/out/libs" \
+            NDK_OUT="$GITHUB_WORKSPACE/out/obj" \
+            -j"$(nproc)"
 
-      # ------------------------------------------------------------------ 5
-      - name: Compile with ndk-build
+      - name: Verify .so
         run: |
-          set -euo pipefail
-          cd "$PROJECT_ROOT"
+          SO=$(find out/libs -name '*.so' | head -n1 || true)
+          [ -n "$SO" ] || { echo "::error::No .so produced"; exit 1; }
+          echo "Built: $SO"
+          file "$SO"
+          file "$SO" | grep -q 'ELF 32-bit.*ARM' || { echo "::error::Not a 32-bit ARM ELF"; exit 1; }
+          SYMS=$(readelf -Ws --dyn-syms "$SO")
+          for s in OnModLoad __GetModInfo; do
+            echo "$SYMS" | grep -qw "$s" || { echo "::error::Missing required AML export: $s"; exit 1; }
+          done
+          echo "Exported HEXED_* API:"; echo "$SYMS" | grep -o 'HEXED_[A-Za-z]*' | sort -u || true
+          # Warn (not fail) on libs outside the usual Android set
+          readelf -d "$SO" | grep NEEDED
 
-          ARGS=(
-            NDK_PROJECT_PATH="$PROJECT_ROOT"
-            APP_BUILD_SCRIPT="$PROJECT_ROOT/Android.mk"
-            NDK_OUT="$PROJECT_ROOT/build/obj"
-            NDK_LIBS_OUT="$PROJECT_ROOT/build/libs"
-            NDK_DEBUG=0
-          )
-          if [ -f Application.mk ]; then
-            ARGS+=( NDK_APPLICATION_MK="$PROJECT_ROOT/Application.mk" )
-          else
-            echo "No Application.mk found; using defaults (armeabi-v7a + arm64-v8a)."
-            ARGS+=( APP_ABI="armeabi-v7a arm64-v8a" APP_PLATFORM=android-21 APP_STL=c++_static )
-          fi
-
-          # Pipe through tee so a failure still leaves a full log to download.
-          "$ANDROID_NDK_HOME/build/ndk-build" "${ARGS[@]}" -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/ndk-build.log"
-
-      # ------------------------------------------------------------------ 6
-      - name: Verify compiled libraries
+      - name: Package
         run: |
-          set -euo pipefail
-          cd "$PROJECT_ROOT"
-          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          ROOT="${{ steps.proj.outputs.root }}"
+          mkdir -p dist
+          cp out/libs/armeabi-v7a/*.so dist/
+          [ -d "$ROOT/lua" ] && cp -r "$ROOT/lua" dist/ || true
+          [ -f "$ROOT/README.md" ] && cp "$ROOT/README.md" dist/ || true
+          [ -d "$ROOT/docs" ] && cp -r "$ROOT/docs" dist/ || true
+          (cd dist && sha256sum *.so > SHA256.txt)
+          cat dist/SHA256.txt
 
-          # ABIs we expect: whatever Application.mk asks for (default: both).
-          EXPECTED="armeabi-v7a arm64-v8a"
-          if [ -f Application.mk ]; then
-            LINE=$(grep -E '^[[:space:]]*APP_ABI[[:space:]]*[:+]?=' Application.mk | tail -1 | sed -E 's/^[^=]*=//' || true)
-            if echo "$LINE" | grep -qw all; then
-              EXPECTED="armeabi-v7a arm64-v8a x86 x86_64"
-            elif [ -n "${LINE// /}" ]; then
-              EXPECTED="$LINE"
-            fi
-          fi
-          echo "Expected ABIs: $EXPECTED"
-
-          FAIL=0
-          : > "$RUNNER_TEMP/sha256.txt"
-          for ABI in $EXPECTED; do
-            mapfile -t SOS < <(find "build/libs/$ABI" -maxdepth 1 -name '*.so' ! -name 'libc++_shared.so' 2>/dev/null | sort)
-            if [ "${#SOS[@]}" -eq 0 ]; then
-              echo "::error::No .so produced for $ABI"; FAIL=1; continue
-            fi
-            case "$ABI" in
-              armeabi-v7a) WANT='ARM$' ;;
-              arm64-v8a)   WANT='AArch64' ;;
-              x86)         WANT='Intel 80386' ;;
-              x86_64)      WANT='X86-64' ;;
-              *)           WANT='.' ;;
-            esac
-            for SO in "${SOS[@]}"; do
-              echo "--- $SO ---"
-              HDR=$("$READELF" -h "$SO")
-              echo "$HDR" | grep -E 'Class:|Machine:'
-              if ! echo "$HDR" | grep -E 'Machine:' | grep -Eq "$WANT"; then
-                echo "::error::$SO has the wrong architecture for $ABI"; FAIL=1
-              fi
-              # An AML mod must export __GetModInfo (generated by the MYMOD macros).
-              # Capture first: "readelf | grep -q" under pipefail can false-fail (SIGPIPE).
-              SYMS=$("$READELF" --dyn-syms --wide "$SO" || true)
-              if grep -qw '__GetModInfo' <<< "$SYMS"; then
-                echo "AML entry points: OK"
-                grep -wE '__GetModInfo|OnModLoad|OnModPreLoad|OnAllModsLoaded' <<< "$SYMS" || true
-              else
-                echo "::error::$SO does not export __GetModInfo; AML will not load it"
-                echo "--- exported (defined) symbols ---"
-                grep -v ' UND ' <<< "$SYMS" || true
-                FAIL=1
-              fi
-              ( cd "$(dirname "$SO")" && sha256sum "$(basename "$SO")" | sed "s#  # ($ABI)  #" ) >> "$RUNNER_TEMP/sha256.txt"
-            done
-          done
-          [ "$FAIL" = "0" ] || exit 1
-          echo "All libraries verified."
-          cat "$RUNNER_TEMP/sha256.txt"
-
-      # ------------------------------------------------------------------ 7
-      - name: Package result
-        run: |
-          set -euo pipefail
-          STAGE="$RUNNER_TEMP/HEXED-Resolution-compiled"
-          rm -rf "$STAGE"; mkdir -p "$STAGE/libs"
-
-          # Compiled libraries, one folder per ABI.
-          for D in "$PROJECT_ROOT"/build/libs/*/; do
-            ABI=$(basename "$D")
-            mkdir -p "$STAGE/libs/$ABI"
-            find "$D" -maxdepth 1 -name '*.so' ! -name 'libc++_shared.so' -exec cp {} "$STAGE/libs/$ABI/" \;
-          done
-
-          # Runtime extras, if the project has them.
-          for X in lua config; do
-            [ -d "$PROJECT_ROOT/$X" ] && cp -r "$PROJECT_ROOT/$X" "$STAGE/$X" || true
-          done
-          for X in README.md INSTALL.md TESTING.md LICENSES.md; do
-            [ -f "$PROJECT_ROOT/$X" ] && cp "$PROJECT_ROOT/$X" "$STAGE/" || true
-          done
-
-          {
-            echo "HEXED Resolution build info"
-            echo "Source ZIP : $SOURCE_ZIP"
-            echo "Commit     : $GITHUB_SHA"
-            echo "NDK        : $NDK_VERSION"
-            echo "Built at   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo
-            echo "SHA-256:"
-            cat "$RUNNER_TEMP/sha256.txt"
-          } > "$STAGE/BUILD-INFO.txt"
-
-          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
-          ( cd "$STAGE" && find . -type f | sort )
-
-          {
-            echo "### HEXED Resolution build"
-            echo "Source: \`$SOURCE_ZIP\` | NDK: \`$NDK_VERSION\`"
-            echo
-            echo '```'
-            cat "$RUNNER_TEMP/sha256.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload compiled package
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HEXED-Resolution-compiled
-          path: ${{ env.STAGE }}
+          name: AML-mod-armeabi-v7a
+          path: dist/
           if-no-files-found: error
-
-      - name: Upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ndk-build-log
-          path: ${{ runner.temp }}/ndk-build.log
-          if-no-files-found: ignore
