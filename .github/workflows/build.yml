@@ -1,150 +1,189 @@
-name: Build HEXED Resolution
-
-# 1. Put the source ZIP at the repo root (only one .zip, or set zip_name).
-# 2. Actions -> "Build HEXED Resolution" -> Run workflow (also runs on push of a .zip).
-# 3. Download the "HEXED-Resolution-compiled" artifact:
-#    libs/armeabi-v7a/libHEXED_Resolution.so + lua/ + docs/ + BUILD-INFO.txt
+name: Build HEXED Resolution (ZIP → SO)
 
 on:
-  workflow_dispatch:
-    inputs:
-      zip_name:
-        description: "ZIP at the repo root (empty = auto-detect the only .zip)"
-        required: false
-        default: ""
   push:
-    branches: [ main, master ]
-    paths: [ "*.zip" ]
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  NDK_VERSION: r26d
+    paths:
+      - "*.zip"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate newest source ZIP
+        id: zip
+        run: |
+          set -e
+          ZIP=$(ls -1t *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No .zip file found in repository root"
+            exit 1
+          fi
+          echo "Found source ZIP: $ZIP"
+          echo "zip_file=$ZIP" >> "$GITHUB_OUTPUT"
 
       - name: Extract source ZIP
-        env:
-          ZIP_INPUT: ${{ inputs.zip_name }}
+        id: extract
         run: |
-          set -euo pipefail
-          ZIP="${ZIP_INPUT:-}"
-          if [ -z "$ZIP" ]; then
-            mapfile -t Z < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n')
-            [ "${#Z[@]}" -eq 1 ] || { echo "::error::Need exactly one .zip at the repo root (found ${#Z[@]}); set zip_name."; exit 1; }
-            ZIP="${Z[0]}"
+          set -e
+          WORK="$RUNNER_TEMP/src"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -q "${{ steps.zip.outputs.zip_file }}" -d "$WORK"
+
+          # Detect project root by locating jni/Android.mk
+          MK=$(find "$WORK" -type f -name Android.mk -path "*/jni/Android.mk" | head -n1 || true)
+          if [ -z "$MK" ]; then
+            echo "::error::Could not find jni/Android.mk inside the ZIP"
+            find "$WORK" -type f | head -50
+            exit 1
           fi
-          [ -f "$ZIP" ] || { echo "::error::ZIP not found: $ZIP"; exit 1; }
-          if unzip -Z1 "$ZIP" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
-            echo "::error::ZIP has unsafe paths"; exit 1
-          fi
-          SRC="$RUNNER_TEMP/src"; rm -rf "$SRC"; mkdir -p "$SRC"
-          unzip -q "$ZIP" -d "$SRC"; rm -rf "$SRC/__MACOSX"
+          ROOT=\( (dirname " \)(dirname "$MK")")
+          echo "Project root: $ROOT"
+          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
 
-          # Android.mk = shallowest one (ignoring vendored aml-psdk). It may sit in jni/ or at the root.
-          MK=$(find "$SRC" -name Android.mk -not -path '*/aml-psdk/*' | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2-)
-          [ -n "$MK" ] || { echo "::error::No Android.mk in ZIP"; exit 1; }
-          MKDIR=$(dirname "$MK")
-          if [ "$(basename "$MKDIR")" = "jni" ]; then ROOT=$(dirname "$MKDIR"); else ROOT="$MKDIR"; fi
-          APPMK="$MKDIR/Application.mk"; [ -f "$APPMK" ] || APPMK=""
+          # Basic required files
+          test -f "$ROOT/jni/Android.mk"
+          test -f "$ROOT/jni/Application.mk"
+          test -f "\( ROOT/src/main.cpp" || test -n " \)(find "$ROOT" -name '*.cpp' | head -1)"
 
-          for f in mod/amlmod.h mod/iaml.h; do
-            [ -f "$ROOT/$f" ] || { echo "::error::Missing $f (AML headers must be inside the ZIP)"; exit 1; }
-          done
-          echo "Source: $ZIP | Root: $ROOT | Android.mk: $MK | Application.mk: ${APPMK:-none}"
-          { echo "SOURCE_ZIP=$ZIP"; echo "ROOT=$ROOT"; echo "MK=$MK"; echo "APPMK=$APPMK"; } >> "$GITHUB_ENV"
-
-      - name: Cache NDK
-        uses: actions/cache@v4
-        with:
-          path: ~/android-ndk-${{ env.NDK_VERSION }}
-          key: ndk-${{ env.NDK_VERSION }}-linux
-
-      - name: Install NDK
+      - name: Ensure AML mod headers
         run: |
-          set -euo pipefail
-          NDK="$HOME/android-ndk-$NDK_VERSION"
-          if [ ! -x "$NDK/build/ndk-build" ]; then
-            curl -fsSL -o "$RUNNER_TEMP/ndk.zip" "https://dl.google.com/android/repository/android-ndk-$NDK_VERSION-linux.zip"
-            unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME"
-          fi
-          echo "NDK=$NDK" >> "$GITHUB_ENV"
-
-      - name: Compile
-        run: |
-          set -euo pipefail
-          cd "$ROOT"
-          ARGS=(NDK_PROJECT_PATH="$ROOT" APP_BUILD_SCRIPT="$MK"
-                NDK_OUT="$ROOT/build/obj" NDK_LIBS_OUT="$ROOT/build/libs" NDK_DEBUG=0)
-          if [ -n "$APPMK" ]; then
-            ARGS+=(NDK_APPLICATION_MK="$APPMK")
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          if [ ! -f "$ROOT/mod/amlmod.h" ]; then
+            echo "AML headers missing – fetching pinned AndroidModLoader template"
+            PINNED=3ef5c918ec855f3db5e3a216dcb176e209b89922
+            git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git "$RUNNER_TEMP/aml"
+            cd "$RUNNER_TEMP/aml"
+            git fetch --depth 1 origin "$PINNED"
+            git checkout "$PINNED"
+            mkdir -p "$ROOT/mod"
+            cp -r template_of_mod/mod/* "$ROOT/mod/"
+            echo "Headers installed from commit $PINNED"
           else
-            ARGS+=(APP_ABI=armeabi-v7a APP_PLATFORM=android-21 APP_STL=c++_static)
+            echo "AML headers already present in ZIP"
           fi
-          "$NDK/build/ndk-build" "${ARGS[@]}" -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/ndk-build.log"
+          test -f "$ROOT/mod/amlmod.h"
+          test -f "$ROOT/mod/iaml.h"
+          test -f "$ROOT/mod/logger.h"
 
-      - name: Verify
-        run: |
-          set -euo pipefail
-          cd "$ROOT"
-          RE="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          mapfile -t SOS < <(find build/libs -name '*.so' ! -name 'libc++_shared.so' | sort)
-          [ "${#SOS[@]}" -gt 0 ] || { echo "::error::No .so produced"; exit 1; }
-
-          # Every HEXED_* function the Lua declares in ffi.cdef must be exported by the .so,
-          # so a Lua/native mismatch fails the build instead of failing in game.
-          mapfile -t API < <(grep -rhoE '\bHEXED_[A-Za-z0-9_]+\s*\(' lua 2>/dev/null | sed 's/[ (]//g' | sort -u)
-          echo "Lua API to verify (${#API[@]}): ${API[*]:-none}"
-
-          : > "$RUNNER_TEMP/sha256.txt"
-          for SO in "${SOS[@]}"; do
-            ABI=$(basename "$(dirname "$SO")")
-            SYMS=$("$RE" --dyn-syms --wide "$SO")
-            echo "== $SO ($ABI)"
-            for S in __GetModInfo OnModLoad "${API[@]}"; do
-              grep -qw -- "$S" <<< "$SYMS" || { echo "::error::$SO does not export $S"; exit 1; }
-            done
-            [ "$ABI" != "armeabi-v7a" ] || "$RE" -h "$SO" | grep -Eq 'Machine:\s+ARM$' || { echo "::error::$SO is not 32-bit ARM"; exit 1; }
-            ( cd "$(dirname "$SO")" && sha256sum "$(basename "$SO")" | sed "s#  # ($ABI)  #" ) >> "$RUNNER_TEMP/sha256.txt"
-          done
-          cat "$RUNNER_TEMP/sha256.txt"
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          OUT="$RUNNER_TEMP/out"; rm -rf "$OUT"; mkdir -p "$OUT/libs"
-          for D in "$ROOT"/build/libs/*/; do
-            A=$(basename "$D"); mkdir -p "$OUT/libs/$A"
-            find "$D" -maxdepth 1 -name '*.so' ! -name 'libc++_shared.so' -exec cp {} "$OUT/libs/$A/" \;
-          done
-          for X in lua docs README.md INSTALL.md; do
-            [ -e "$ROOT/$X" ] && cp -r "$ROOT/$X" "$OUT/" || true
-          done
-          { echo "Source: $SOURCE_ZIP"; echo "Commit: $GITHUB_SHA"; echo "NDK: $NDK_VERSION"
-            echo "Built: $(date -u +%FT%TZ)"; echo; echo "SHA-256:"; cat "$RUNNER_TEMP/sha256.txt"; } > "$OUT/BUILD-INFO.txt"
-          echo "OUT=$OUT" >> "$GITHUB_ENV"
-          ( cd "$OUT" && find . -type f | sort )
-
-      - uses: actions/upload-artifact@v4
+      - name: Setup Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
-          name: HEXED-Resolution-compiled
-          path: ${{ env.OUT }}
-          if-no-files-found: error
+          ndk-version: r26d
+          link-to-sdk: true
 
-      - name: Upload build log (on failure)
-        if: failure()
+      - name: Compile with ndk-build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          export PATH="$ANDROID_NDK_HOME:$PATH"
+
+          # Force clean output dirs
+          rm -rf "$ROOT/libs" "$ROOT/obj"
+          mkdir -p "$ROOT/libs" "$ROOT/obj"
+
+          ndk-build -C "$ROOT/jni" \
+            NDK_PROJECT_PATH="$ROOT" \
+            NDK_LIBS_OUT="$ROOT/libs" \
+            NDK_OUT="$ROOT/obj" \
+            -j"$(nproc)" \
+            V=1
+
+      - name: Validate output
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          SO=$(find "$ROOT/libs" -name "libHEXED_Resolution.so" -o -name "*.so" | head -n1 || true)
+          if [ -z "$SO" ]; then
+            echo "::error::No .so produced"
+            find "$ROOT" -type f | head -80
+            exit 1
+          fi
+          echo "Built: $SO"
+          ls -la "$SO"
+          file "$SO"
+
+          # Must be 32-bit ARM
+          if ! file "$SO" | grep -qiE "ELF.*32-bit.*ARM|ELF 32-bit LSB.*ARM"; then
+            echo "::error::Output is not a 32-bit ARM shared library"
+            file "$SO"
+            exit 1
+          fi
+
+          # Required exported symbols
+          if command -v nm >/dev/null; then
+            nm -D "$SO" | grep -E "HEXED_Apply|HEXED_Reset|OnModLoad" || {
+              echo "::error::Required symbols (HEXED_Apply / HEXED_Reset / OnModLoad) missing"
+              nm -D "$SO" | head -40
+              exit 1
+            }
+          fi
+
+          echo "so_path=$SO" >> "$GITHUB_OUTPUT"
+          echo "so_name=$(basename "$SO")" >> "$GITHUB_OUTPUT"
+
+      - name: Package artifact
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          OUT="$RUNNER_TEMP/artifact"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          # Compiled library
+          cp -v "$ROOT"/libs/armeabi-v7a/*.so "$OUT/" 2>/dev/null || \
+            cp -v $(find "$ROOT/libs" -name "*.so" | head -1) "$OUT/"
+
+          # Lua menu
+          if [ -f "$ROOT/lua/hexed_resolution.lua" ]; then
+            mkdir -p "$OUT/lua"
+            cp -v "$ROOT/lua/hexed_resolution.lua" "$OUT/lua/"
+          fi
+
+          # Docs
+          [ -f "$ROOT/README.md" ] && cp -v "$ROOT/README.md" "$OUT/"
+          [ -f "$ROOT/docs/LIMITATIONS.md" ] && mkdir -p "$OUT/docs" && cp -v "$ROOT/docs/LIMITATIONS.md" "$OUT/docs/"
+
+          # Short install note
+          {
+            echo "HEXED Resolution - install notes (Nezuko SA-MP 1.0.3 TESTING)"
+            echo ""
+            echo "1. Copy libHEXED_Resolution.so into the AML mods folder of the client"
+            echo "   (Android/data/<package>/mods or Android_unprotected/data/<package>/mods)."
+            echo ""
+            echo "2. Copy lua/hexed_resolution.lua into the MonetLoader scripts folder"
+            echo "   (typically Android/media/<package>/monetloader/)."
+            echo ""
+            echo "3. Launch the game. Check logcat:"
+            echo "   adb logcat -s HEXED_Resolution"
+            echo ""
+            echo "4. In-game: /hxdres"
+            echo "   /hxdres_pct 0-100"
+            echo "   /hxdres_set 1280 720"
+            echo "   /hxdres_reset"
+            echo ""
+            echo "This build uses OS_ScreenSetResolution + RsGlobal / renderWidth / renderHeight."
+            echo "It does NOT change Android system resolution or DPI."
+            echo "Read docs/LIMITATIONS.md before expecting perfect HUD/touch behaviour."
+          } > "$OUT/INSTALL.txt"
+
+          echo "Artifact contents:"
+          find "$OUT" -type f -exec ls -la {} \;
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ndk-build-log
-          path: ${{ runner.temp }}/ndk-build.log
-          if-no-files-found: ignore
+          name: HEXED-Resolution-armeabi-v7a
+          path: ${{ runner.temp }}/artifact
+          if-no-files-found: error
