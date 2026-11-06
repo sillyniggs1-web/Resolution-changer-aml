@@ -1,0 +1,202 @@
+name: Build HEXED Resolution (ZIP → SO)
+
+on:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate newest source ZIP
+        id: zip
+        run: |
+          set -e
+          ZIP=$(ls -1t *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No .zip file found in repository root"
+            exit 1
+          fi
+          echo "Found source ZIP: $ZIP"
+          echo "zip_file=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Extract source ZIP
+        id: extract
+        run: |
+          set -e
+          WORK="$RUNNER_TEMP/src"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -q "${{ steps.zip.outputs.zip_file }}" -d "$WORK"
+
+          MK=$(find "$WORK" -type f -name Android.mk | grep '/jni/Android.mk$' | head -n1 || true)
+          if [ -z "$MK" ]; then
+            echo "::error::Could not find jni/Android.mk inside the ZIP"
+            find "$WORK" -type f | head -50
+            exit 1
+          fi
+          ROOT=$(dirname "$(dirname "$MK")")
+          echo "Project root: $ROOT"
+          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f "$ROOT/jni/Android.mk" ]; then
+            echo "::error::Missing jni/Android.mk"
+            exit 1
+          fi
+          if [ ! -f "$ROOT/jni/Application.mk" ]; then
+            echo "::error::Missing jni/Application.mk"
+            exit 1
+          fi
+          if [ ! -f "$ROOT/src/main.cpp" ]; then
+            CPP=$(find "$ROOT" -name '*.cpp' -type f | head -n1 || true)
+            if [ -z "$CPP" ]; then
+              echo "::error::No .cpp source found"
+              exit 1
+            fi
+          fi
+
+      - name: Ensure AML mod headers
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          if [ ! -f "$ROOT/mod/amlmod.h" ]; then
+            echo "AML headers missing – fetching pinned AndroidModLoader template"
+            PINNED=3ef5c918ec855f3db5e3a216dcb176e209b89922
+            git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git "$RUNNER_TEMP/aml"
+            cd "$RUNNER_TEMP/aml"
+            git fetch --depth 1 origin "$PINNED"
+            git checkout "$PINNED"
+            mkdir -p "$ROOT/mod"
+            cp -r template_of_mod/mod/* "$ROOT/mod/"
+            echo "Headers installed from commit $PINNED"
+          else
+            echo "AML headers already present in ZIP"
+          fi
+          test -f "$ROOT/mod/amlmod.h"
+          test -f "$ROOT/mod/iaml.h"
+          test -f "$ROOT/mod/logger.h"
+
+      - name: Setup Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          link-to-sdk: true
+
+      - name: Compile with ndk-build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          export PATH="$ANDROID_NDK_HOME:$PATH"
+
+          rm -rf "$ROOT/libs" "$ROOT/obj"
+          mkdir -p "$ROOT/libs" "$ROOT/obj"
+
+          set +e
+          ndk-build -C "$ROOT/jni" \
+            NDK_PROJECT_PATH="$ROOT" \
+            NDK_LIBS_OUT="$ROOT/libs" \
+            NDK_OUT="$ROOT/obj" \
+            -j"$(nproc)" \
+            V=1 2>&1 | tee "$RUNNER_TEMP/ndk-build.log"
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "::error::ndk-build failed; see the first compiler error above and the uploaded build log."
+            exit "$BUILD_STATUS"
+          fi
+
+      - name: Validate output
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          SO=$(find "$ROOT/libs" -name 'libHEXED_Resolution.so' -o -name '*.so' | head -n1 || true)
+          if [ -z "$SO" ]; then
+            echo "::error::No .so produced"
+            find "$ROOT" -type f | head -80
+            exit 1
+          fi
+          echo "Built: $SO"
+          ls -la "$SO"
+          file "$SO"
+
+          if ! file "$SO" | grep -qiE 'ELF.*32-bit.*ARM|ELF 32-bit LSB.*ARM'; then
+            echo "::error::Output is not a 32-bit ARM shared library"
+            file "$SO"
+            exit 1
+          fi
+
+          if command -v nm >/dev/null; then
+            nm -D "$SO" | grep -E 'HEXED_SetScale|HEXED_SetSize|HEXED_IsReady|OnModLoad' || {
+              echo "::error::Required symbols missing"
+              nm -D "$SO" | head -40
+              exit 1
+            }
+          fi
+
+      - name: Package artifact
+        run: |
+          set -e
+          ROOT="${{ steps.extract.outputs.project_root }}"
+          OUT="$RUNNER_TEMP/artifact"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          cp -v "$ROOT"/libs/armeabi-v7a/*.so "$OUT/" 2>/dev/null || \
+            cp -v $(find "$ROOT/libs" -name '*.so' | head -1) "$OUT/"
+
+          if [ -f "$ROOT/lua/hexed_resolution.lua" ]; then
+            mkdir -p "$OUT/lua"
+            cp -v "$ROOT/lua/hexed_resolution.lua" "$OUT/lua/"
+          fi
+
+          [ -f "$ROOT/README.md" ] && cp -v "$ROOT/README.md" "$OUT/"
+          [ -f "$ROOT/docs/LIMITATIONS.md" ] && mkdir -p "$OUT/docs" && cp -v "$ROOT/docs/LIMITATIONS.md" "$OUT/docs/"
+
+          cat > "$OUT/INSTALL.txt" << 'NOTE'
+          HEXED Resolution - install notes (Nezuko SA-MP 1.0.3 TESTING)
+
+          1. Copy libHEXED_Resolution.so into the AML mods folder of the client
+             (Android/data/<package>/mods or Android_unprotected/data/<package>/mods).
+
+          2. Copy lua/hexed_resolution.lua into the MonetLoader scripts folder
+             (typically Android/media/<package>/monetloader/).
+
+          3. Launch the game. Check logcat:
+             adb logcat -s HEXED_Resolution
+
+          4. In-game: /hxdres
+             /hxdres_pct 0-100
+             /hxdres_set 1280 720
+             /hxdres_reset
+
+          Uses OS_ScreenSetResolution + RsGlobal. Does NOT change Android system DPI.
+          NOTE
+
+          echo "Artifact contents:"
+          find "$OUT" -type f -exec ls -la {} \;
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HEXED-Resolution-armeabi-v7a
+          path: ${{ runner.temp }}/artifact
+          if-no-files-found: error
+
+      - name: Upload compiler log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HEXED-Resolution-build-log
+          path: ${{ runner.temp }}/ndk-build.log
+          if-no-files-found: ignore
